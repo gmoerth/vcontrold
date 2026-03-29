@@ -67,32 +67,94 @@ int getErrState(enumPtr ePtr, char *recv, int len, char *result);
 int getSysTime(char *recv, int len, char *result);
 int setSysTime(char *input, char *sendBuf);
 
-int getCycleTime(char *recv, int len, char *result)
+static int parseCycleTimeToken(const char *token, unsigned char emptyValue, unsigned char *value)
 {
-    int i;
-    char string[80];
+    unsigned int hour, min;
+    char tail;
 
-    if (len % 2) {
-        sprintf(result, "Byte count not even");
+    if ((strcmp(token, "-") == 0) || (strcmp(token, "--") == 0)) {
+        *value = emptyValue;
+        return 1;
+    }
+
+    if (strchr(token, ':') == NULL) {
         return 0;
     }
 
-    memset(string, 0, sizeof(string));
-
-    for (i = 0; i < len; i += 2) {
-        // TODO - vitoopen: Leave output in German.
-        // CHANGING THIS WOULD BREAK existing applications.
-        // => maybe we could enable english results later with a build option,
-        // but not for the default.
-        if (recv[i] == (char)0xff) {
-            snprintf(string, sizeof(string), "%d:An:--     Aus:--\n", (i / 2) + 1);
-        } else {
-            snprintf(string, sizeof(string), "%d:An:%02d:%02d  Aus:%02d:%02d\n", (i / 2) + 1,
-                     (recv[i] & 0xF8) >> 3, (recv[i] & 7) * 10,
-                     (recv[i + 1] & 0xF8) >> 3, (recv[i + 1] & 7) * 10);
-        }
-        strcat(result, string);
+    if (sscanf(token, "%u:%u%c", &hour, &min, &tail) != 2) {
+        return 0;
     }
+
+    if ((hour > 24) || (min > 59) || ((min % 10) != 0)) {
+        return 0;
+    }
+
+    *value = ((hour << 3) + (min / 10)) & 0xff;
+
+    return 1;
+}
+
+int getCycleTime(char *recv, int len, char *result)
+{
+    int i;
+    char string[256];
+    char onTime[8];
+    char offTime[8];
+
+    memset(string, 0, sizeof(string));
+    memset(onTime, 0, sizeof(onTime));
+    memset(offTime, 0, sizeof(offTime));
+
+    if(len == 8) {
+        for (i = 0; i < len; i += 2) {
+            // TODO - vitoopen: Leave output in German.
+            // CHANGING THIS WOULD BREAK existing applications.
+            // => maybe we could enable english results later with a build option,
+            // but not for the default.
+            if (recv[i] == (char)0xff) {
+                snprintf(string, sizeof(string), "%d:An:--     Aus:--\n", (i / 2) + 1);
+            } else {
+                snprintf(string, sizeof(string), "%d:An:%02d:%02d  Aus:%02d:%02d\n", (i / 2) + 1,
+                        (recv[i] & 0xF8) >> 3, (recv[i] & 7) * 10,
+                        (recv[i + 1] & 0xF8) >> 3, (recv[i + 1] & 7) * 10);
+            }
+            strcat(result, string);
+        }
+    } else if(len == 15) {
+        for (i = 0; i < len; i += 3) {
+            // TODO - vitoopen: Leave output in German.
+            // CHANGING THIS WOULD BREAK existing applications.
+            // => maybe we could enable english results later with a build option,
+            // but not for the default.
+            if ((recv[i] == (char)0x00) && (recv[i + 1] == (char)0x00)) {
+                snprintf(string, sizeof(string), "%d:An:--     Aus:--     Mod:--\n", (i / 3) + 1);
+                strcat(result, string);
+                continue;
+            }
+
+            if (recv[i] == (char)0x00) {
+                snprintf(onTime, sizeof(onTime), "--");
+            } else {
+                snprintf(onTime, sizeof(onTime), "%02d:%02d",
+                        (recv[i] & 0xF8) >> 3, (recv[i] & 7) * 10);
+            }
+
+            if (recv[i + 1] == (char)0x00) {
+                snprintf(offTime, sizeof(offTime), "--");
+            } else {
+                snprintf(offTime, sizeof(offTime), "%02d:%02d",
+                        (recv[i + 1] & 0xF8) >> 3, (recv[i + 1] & 7) * 10);
+            }
+
+            snprintf(string, sizeof(string), "%d:An:%-5s  Aus:%-5s  Mod:%02d\n", (i / 3) + 1,
+                    onTime, offTime, (recv[i + 2] & 0x7F));
+            strcat(result, string);
+        }       
+    } else {
+        sprintf(result, "Byte count not 8 or 15");
+        return 0;
+    }
+
     result[strlen(result) - 1] = '\0'; // remove \n
 
     return 1;
@@ -102,20 +164,85 @@ int setCycleTime(char *input, char *sendBuf)
 {
     char *sptr, *cptr;
     char *bptr = sendBuf;
-    int hour, min;
+    char *tokens[16];
+    char *endptr;
+    long modeValue;
+    unsigned char timeValue;
+    int idx = 0;
+    int tokenCount = 0;
     int count = 0;
 
     // We split at the blank
     sptr = strtok(input, " ");
     cptr = NULL;
 
+    while ((sptr != NULL) && (tokenCount < 16)) {
+        tokens[tokenCount++] = sptr;
+        sptr = strtok(NULL, " ");
+    }
+
+    if (tokenCount == 15) {
+        memset(sendBuf, 0x00, 15);
+
+        for (count = 0; count < 15; count += 3) {
+            if (!parseCycleTimeToken(tokens[count], 0x00, &timeValue)) {
+                sprintf(sendBuf, "Wrong time format: %s", tokens[count]);
+                return 0;
+            }
+            sendBuf[count] = timeValue;
+            logIT(LOG_INFO, "Cycle Time: %s -> [%02X]", tokens[count], timeValue);
+
+            if (!parseCycleTimeToken(tokens[count + 1], 0x00, &timeValue)) {
+                sprintf(sendBuf, "Wrong time format: %s", tokens[count + 1]);
+                return 0;
+            }
+            sendBuf[count + 1] = timeValue;
+            logIT(LOG_INFO, "Cycle Time: %s -> [%02X]", tokens[count + 1], timeValue);
+
+            if ((sendBuf[count] == 0x00) && (sendBuf[count + 1] == 0x00)) {
+                if ((strcmp(tokens[count + 2], "-") != 0) && (strcmp(tokens[count + 2], "--") != 0)) {
+                    sprintf(sendBuf, "Wrong empty block format: %s %s %s",
+                            tokens[count], tokens[count + 1], tokens[count + 2]);
+                    return 0;
+                }
+                sendBuf[count + 2] = 0x00;
+                logIT(LOG_INFO, "Cycle Mode: %s -> [%02X]", tokens[count + 2], sendBuf[count + 2]);
+                continue;
+            }
+
+            if ((strcmp(tokens[count + 2], "-") == 0) || (strcmp(tokens[count + 2], "--") == 0)) {
+                sprintf(sendBuf, "Wrong mode format: %s", tokens[count + 2]);
+                return 0;
+            }
+
+            errno = 0;
+            modeValue = strtol(tokens[count + 2], &endptr, 0);
+            if ((errno != 0) || (*tokens[count + 2] == '\0') || (*endptr != '\0') ||
+                    (modeValue < 0) || (modeValue > 0xff)) {
+                sprintf(sendBuf, "Wrong mode format: %s", tokens[count + 2]);
+                return 0;
+            }
+            sendBuf[count + 2] = (unsigned char)modeValue;
+            logIT(LOG_INFO, "Cycle Mode: %s -> [%02X]", tokens[count + 2], sendBuf[count + 2]);
+        }
+
+        return 15;
+    }
+
     // First, we fill the sendBuf with 8 x ff
     for (count = 0; count < 8; sendBuf[count++] = 0xff);
     count = 0;
 
-    do {
+    if (tokenCount == 0) {
+        return 8;
+    }
+
+    while (idx < tokenCount) {
+        sptr = tokens[idx];
+
         if (sptr < cptr) {
             // We already have been here (by double blanks)
+            idx++;
             continue;
         }
 
@@ -127,7 +254,12 @@ int setCycleTime(char *input, char *sendBuf)
             // We skip the next time designation, as it also must be a "-"
             bptr++;
             count++;
-            sptr = strtok(NULL, " ");
+            idx++;
+            if (idx < tokenCount) {
+                cptr = tokens[idx];
+            } else {
+                cptr = sptr;
+            }
             logIT(LOG_INFO, "Cycle Time: -- -- -> [%02X%02X]", 0xff, 0xff);
         } else {
             // Is the a : in the string?
@@ -135,15 +267,18 @@ int setCycleTime(char *input, char *sendBuf)
                 sprintf(sendBuf, "Wrong time format: %s", sptr);
                 return 0;
             }
-            sscanf(sptr, "%u:%u", &hour, &min);
-            *bptr = ((hour << 3) + (min / 10)) & 0xff;
-            logIT(LOG_INFO, "Cycle Time: %02d:%02d -> [%02X]", hour, min, (unsigned char) *bptr);
+            if (!parseCycleTimeToken(sptr, 0xff, &timeValue)) {
+                sprintf(sendBuf, "Wrong time format: %s", sptr);
+                return 0;
+            }
+            *bptr = timeValue;
+            logIT(LOG_INFO, "Cycle Time: %s -> [%02X]", sptr, (unsigned char) *bptr);
+            cptr = sptr;
         }
         bptr++;
-        cptr = sptr;
         count++;
-
-    } while ((sptr = strtok(NULL, " ")) != NULL);
+        idx++;
+    }
 
     if ((count / 2) * 2 != count) {
         logIT(LOG_WARNING, "Times count odd, ignoring %s", cptr);
